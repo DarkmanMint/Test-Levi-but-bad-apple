@@ -3,6 +3,7 @@
 // - Draws 1-bit frames as filled rectangles via pl::modmenu::submitDrawCommands.
 // - If resources/bad_apple.bap is not found next to the .so, it plays a built-in
 //   test animation (bouncing white box) so you can check that drawing works.
+// - Audio: plays resources/bad_apple.mp3 through android.media.MediaPlayer (JNI).
 //
 // .bap format (little-endian):
 //   "BAP1", u16 width, u16 height, u16 fps, u16 reserved, u32 frameCount,
@@ -11,6 +12,7 @@
 #include <pl/ModMenu.hpp>
 
 #include <dlfcn.h>
+#include <jni.h>
 
 #include <algorithm>
 #include <atomic>
@@ -60,6 +62,163 @@ std::string moduleDir() {
   }
   return {};
 }
+
+
+// ---------------------------------------------------------------- JNI audio
+JavaVM *gVm = nullptr;
+
+JavaVM *findVm() {
+  if (gVm) return gVm;
+  using GetVmsFn = jint (*)(JavaVM **, jsize, jsize *);
+  void *sym = dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+  if (!sym) {
+    if (void *h = dlopen("libnativehelper.so", RTLD_NOW)) sym = dlsym(h, "JNI_GetCreatedJavaVMs");
+  }
+  if (!sym) {
+    if (void *h = dlopen("libart.so", RTLD_NOW)) sym = dlsym(h, "JNI_GetCreatedJavaVMs");
+  }
+  if (!sym) return nullptr;
+  JavaVM *vms[1] = {nullptr};
+  jsize n = 0;
+  if (reinterpret_cast<GetVmsFn>(sym)(vms, 1, &n) == JNI_OK && n > 0) gVm = vms[0];
+  return gVm;
+}
+
+// Attaches the current thread to the JVM for the lifetime of the object.
+struct JniScope {
+  JavaVM *vm = nullptr;
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  JniScope() {
+    vm = findVm();
+    if (!vm) return;
+    const jint rc = vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    if (rc == JNI_EDETACHED) {
+      if (vm->AttachCurrentThread(&env, nullptr) == JNI_OK) attached = true;
+      else env = nullptr;
+    } else if (rc != JNI_OK) {
+      env = nullptr;
+    }
+  }
+  ~JniScope() {
+    if (attached && vm) vm->DetachCurrentThread();
+  }
+  JniScope(const JniScope &) = delete;
+  JniScope &operator=(const JniScope &) = delete;
+  explicit operator bool() const { return env != nullptr; }
+};
+
+bool clearException(JNIEnv *env) {
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return true;
+  }
+  return false;
+}
+
+jmethodID findMethod(JNIEnv *env, jclass cls, const char *name, const char *sig) {
+  jmethodID m = env->GetMethodID(cls, name, sig);
+  if (clearException(env)) return nullptr;
+  return m;
+}
+
+// Thin wrapper around android.media.MediaPlayer.
+class Audio {
+public:
+  bool start(const std::string &path) {
+    std::lock_guard lock(mMutex);
+    releaseLocked();
+    JniScope jni;
+    if (!jni) return false;
+    JNIEnv *env = jni.env;
+
+    jclass cls = env->FindClass("android/media/MediaPlayer");
+    if (!cls || clearException(env)) return false;
+    jmethodID ctor = findMethod(env, cls, "<init>", "()V");
+    jobject local = ctor ? env->NewObject(cls, ctor) : nullptr;
+    if (!local || clearException(env)) {
+      env->DeleteLocalRef(cls);
+      return false;
+    }
+    jobject player = env->NewGlobalRef(local);
+    env->DeleteLocalRef(local);
+
+    bool ok = false;
+    jmethodID setSource = findMethod(env, cls, "setDataSource", "(Ljava/lang/String;)V");
+    jmethodID prepare = findMethod(env, cls, "prepare", "()V");
+    jmethodID startM = findMethod(env, cls, "start", "()V");
+    if (setSource && prepare && startM) {
+      jstring js = env->NewStringUTF(path.c_str());
+      env->CallVoidMethod(player, setSource, js);
+      env->DeleteLocalRef(js);
+      if (!clearException(env)) {
+        env->CallVoidMethod(player, prepare);
+        if (!clearException(env)) {
+          env->CallVoidMethod(player, startM);
+          ok = !clearException(env);
+        }
+      }
+    }
+    env->DeleteLocalRef(cls);
+    if (!ok) {
+      destroyPlayer(env, player);
+      return false;
+    }
+    mPlayer = player;
+    return true;
+  }
+
+  // Seek to the beginning and play again (used when the video loops).
+  void restart() {
+    std::lock_guard lock(mMutex);
+    if (!mPlayer) return;
+    JniScope jni;
+    if (!jni) return;
+    JNIEnv *env = jni.env;
+    jclass cls = env->GetObjectClass(mPlayer);
+    jmethodID seekTo = findMethod(env, cls, "seekTo", "(I)V");
+    jmethodID startM = findMethod(env, cls, "start", "()V");
+    if (seekTo) {
+      env->CallVoidMethod(mPlayer, seekTo, static_cast<jint>(0));
+      clearException(env);
+    }
+    if (startM) {
+      env->CallVoidMethod(mPlayer, startM);
+      clearException(env);
+    }
+    env->DeleteLocalRef(cls);
+  }
+
+  void stop() {
+    std::lock_guard lock(mMutex);
+    releaseLocked();
+  }
+
+private:
+  std::mutex mMutex;
+  jobject mPlayer = nullptr;
+
+  void releaseLocked() {
+    if (!mPlayer) return;
+    JniScope jni;
+    if (jni) destroyPlayer(jni.env, mPlayer);
+    mPlayer = nullptr;
+  }
+
+  static void destroyPlayer(JNIEnv *env, jobject player) {
+    jclass cls = env->GetObjectClass(player);
+    if (jmethodID stopM = findMethod(env, cls, "stop", "()V")) {
+      env->CallVoidMethod(player, stopM);
+      clearException(env);
+    }
+    if (jmethodID releaseM = findMethod(env, cls, "release", "()V")) {
+      env->CallVoidMethod(player, releaseM);
+      clearException(env);
+    }
+    env->DeleteLocalRef(cls);
+    env->DeleteGlobalRef(player);
+  }
+};
 
 struct Video {
   int w = 0, h = 0, fps = 15;
@@ -160,6 +319,7 @@ public:
 
   bool disable() {
     stopWorker();
+    mAudio.stop();
     clearOverlay();
     pl::modmenu::unregisterModule(kModuleId);
     getSelf().getLogger().info("Disabled");
@@ -168,6 +328,7 @@ public:
 
   bool unload() {
     stopWorker();
+    mAudio.stop();
     pl::modmenu::unregisterModule(kModuleId);
     return true;
   }
@@ -181,6 +342,8 @@ private:
   std::atomic_bool mRestart{false};
   std::mutex mVideoMutex;
   Video mVideo;
+  Audio mAudio;
+  std::string mAudioPath;
   std::thread mWorker;
 
   static void onModuleToggle(std::string_view id, bool enabled) {
@@ -216,10 +379,24 @@ private:
           }
         }
       }
+      mAudioPath.clear();
+      {
+        const std::string dir = moduleDir();
+        for (const char *rel : {"/resources/bad_apple.mp3", "/bad_apple.mp3"}) {
+          const std::string p = dir + rel;
+          if (FILE *f = std::fopen(p.c_str(), "rb")) {
+            std::fclose(f);
+            mAudioPath = p;
+            break;
+          }
+        }
+        if (mAudioPath.empty()) getSelf().getLogger().warn("bad_apple.mp3 not found in {}, no sound", dir);
+      }
       mRestart = true;
       mActive = true;
     } else {
       mActive = false;
+      mAudio.stop();
       clearOverlay();
       std::lock_guard lock(mVideoMutex);
       mVideo.clear();  // free RAM while off
@@ -232,7 +409,11 @@ private:
     if (key == kBlockSizeKey) mBlock = std::clamp(parseInt(value, mBlock.load()), 1, 16);
     else if (key == kFpsKey) mFps = std::clamp(parseInt(value, mFps.load()), 0, 30);
     else if (key == kLoopKey) mLoop = parseBool(value, mLoop.load());
-    else if (key == kSoundKey) mSound = parseBool(value, mSound.load());
+    else if (key == kSoundKey) {
+      mSound = parseBool(value, mSound.load());
+      if (!mSound) mAudio.stop();
+      else if (mActive) mRestart = true;  // restart picture and sound together
+    }
     else if (key == kPosXKey) mPosX = std::clamp(parseInt(value, mPosX.load()), 0, 2000);
     else if (key == kPosYKey) mPosY = std::clamp(parseInt(value, mPosY.load()), 0, 1000);
   }
@@ -250,12 +431,19 @@ private:
   void workerLoop() {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
+    size_t prevIdx = 0;
+    bool audioOn = false;
     while (mRunning) {
       int fps = 15;
       if (mActive) {
-        if (mRestart.exchange(false)) start = clock::now();
+        if (mRestart.exchange(false)) {
+          audioOn = mSound && !mAudioPath.empty() && mAudio.start(mAudioPath);
+          start = clock::now();  // reset the picture clock right after the sound starts
+          prevIdx = 0;
+        }
         std::vector<pl::modmenu::DrawCommand> cmds;
         bool finished = false;
+        bool wrapped = false;
         {
           std::lock_guard lock(mVideoMutex);
           if (mVideo.loaded()) {
@@ -267,11 +455,17 @@ private:
               if (mLoop) idx %= mVideo.frames;
               else { idx = mVideo.frames - 1; finished = true; }
             }
+            wrapped = idx < prevIdx;
+            prevIdx = idx;
             buildCommands(idx, cmds);
           }
         }
+        if (wrapped && audioOn) mAudio.restart();
         if (!cmds.empty()) pl::modmenu::submitDrawCommands(kModuleId, cmds);
-        if (finished) mActive = false;
+        if (finished) {
+          mActive = false;
+          mAudio.stop();
+        }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1000 / std::max(fps, 1)));
     }
@@ -308,5 +502,10 @@ private:
 };
 
 } // namespace
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+  gVm = vm;
+  return JNI_VERSION_1_6;
+}
 
 PL_REGISTER_MOD(BadAppleMod, BadAppleMod::instance())
