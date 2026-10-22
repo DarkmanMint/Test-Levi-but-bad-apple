@@ -21,12 +21,23 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       - name: Package .levipack
         run: |
-          mkdir -p dist/BadAppleOverlay/config
+          mkdir -p dist/BadAppleOverlay/config dist/BadAppleOverlay/resources
           cp manifest.json dist/BadAppleOverlay/
           cp config/config.json config/config.schema.json dist/BadAppleOverlay/config/
           cp build/libbad_apple_overlay.so dist/BadAppleOverlay/
+          VIDEO=$(find . -type f -name '*.mp4' -not -path './build/*' -not -path './dist/*' | head -n1)
+          if [ -n "$VIDEO" ]; then
+            echo "Converting $VIDEO"
+            python3 tools/make_bap.py "$VIDEO" dist/BadAppleOverlay/resources/bad_apple.bap
+          else
+            echo "No .mp4 found, the mod will play the test animation"
+          fi
           cd dist
           zip -r BadAppleOverlay.levipack BadAppleOverlay
       - uses: actions/upload-artifact@v4
