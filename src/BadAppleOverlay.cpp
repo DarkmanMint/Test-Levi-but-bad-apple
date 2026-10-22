@@ -1,109 +1,312 @@
+// Bad Apple player module (v3).
+// - Registers a Mod Menu module (master switch = the module's own on/off).
+// - Draws 1-bit frames as filled rectangles via pl::modmenu::submitDrawCommands.
+// - If resources/bad_apple.bap is not found next to the .so, it plays a built-in
+//   test animation (bouncing white box) so you can check that drawing works.
+//
+// .bap format (little-endian):
+//   "BAP1", u16 width, u16 height, u16 fps, u16 reserved, u32 frameCount,
+//   then frameCount * ceil(width*height/8) bytes, row-major, MSB first, 1 = white.
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
-#include <pl/Input.hpp>
+
+#include <dlfcn.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
-constexpr const char* kModuleId = "bad_apple_overlay.window";
-constexpr int kPanelW = 360;
-constexpr int kPanelH = 220;
-constexpr int kTitleH = 36;
 
-std::vector<unsigned char> makeRgba(int w, int h, unsigned char r,
-                                   unsigned char g, unsigned char b,
-                                   unsigned char a) {
-  std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-  for (size_t i = 0; i < pixels.size(); i += 4) {
-    pixels[i] = r; pixels[i + 1] = g; pixels[i + 2] = b; pixels[i + 3] = a;
-  }
-  return pixels;
+constexpr const char *kModuleId = "bad_apple.module";
+constexpr const char *kBlockSizeKey = "blockSize";
+constexpr const char *kFpsKey = "fps";
+constexpr const char *kLoopKey = "loop";
+constexpr const char *kSoundKey = "sound";
+constexpr const char *kPosXKey = "posX";
+constexpr const char *kPosYKey = "posY";
+
+bool parseBool(std::string_view v, bool fallback) {
+  if (v == "true" || v == "1" || v == "on") return true;
+  if (v == "false" || v == "0" || v == "off") return false;
+  return fallback;
 }
 
-class BadAppleOverlayMod {
-public:
-  static BadAppleOverlayMod& instance() {
-    static BadAppleOverlayMod value;
-    return value;
+int parseInt(std::string_view v, int fallback) {
+  std::string t(v);
+  char *end = nullptr;
+  errno = 0;
+  const long p = std::strtol(t.c_str(), &end, 10);
+  if (end == t.c_str() || *end != '\0' || errno == ERANGE) return fallback;
+  return static_cast<int>(p);
+}
+
+std::string moduleDir() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void *>(&moduleDir), &info) && info.dli_fname) {
+    std::string p(info.dli_fname);
+    const auto pos = p.find_last_of('/');
+    if (pos != std::string::npos) return p.substr(0, pos);
   }
-  BadAppleOverlayMod() : self(*ll::mod::NativeMod::current()) {}
-  ll::mod::NativeMod& getSelf() const { return self; }
+  return {};
+}
+
+struct Video {
+  int w = 0, h = 0, fps = 15;
+  uint32_t frames = 0;
+  size_t frameBytes = 0;
+  std::vector<uint8_t> data;
+  bool fromFile = false;
+
+  bool loadFile(const std::string &path) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[4];
+    uint16_t pw = 0, ph = 0, pfps = 0, rsv = 0;
+    uint32_t n = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "BAP1", 4) == 0 &&
+              std::fread(&pw, 2, 1, f) == 1 && std::fread(&ph, 2, 1, f) == 1 &&
+              std::fread(&pfps, 2, 1, f) == 1 && std::fread(&rsv, 2, 1, f) == 1 &&
+              std::fread(&n, 4, 1, f) == 1 && pw > 0 && ph > 0 && pfps > 0 && n > 0;
+    if (ok) {
+      w = pw; h = ph; fps = pfps; frames = n;
+      frameBytes = (static_cast<size_t>(w) * h + 7) / 8;
+      data.resize(frameBytes * frames);
+      ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+    }
+    std::fclose(f);
+    if (!ok) clear();
+    fromFile = ok;
+    return ok;
+  }
+
+  // Built-in test animation: a bouncing white box with a white border.
+  void makeTest() {
+    w = 64; h = 48; fps = 15; frames = 120;
+    frameBytes = (static_cast<size_t>(w) * h + 7) / 8;
+    data.assign(frameBytes * frames, 0);
+    for (uint32_t t = 0; t < frames; ++t) {
+      const int bx = static_cast<int>(t * 2) % (2 * (w - 12));
+      const int boxX = bx < (w - 12) ? bx : 2 * (w - 12) - bx;
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const bool border = x == 0 || y == 0 || x == w - 1 || y == h - 1;
+          const bool box = x >= boxX && x < boxX + 12 && y >= 18 && y < 30;
+          if (border || box) {
+            const size_t bit = static_cast<size_t>(y) * w + x;
+            data[t * frameBytes + (bit >> 3)] |= static_cast<uint8_t>(1u << (7 - (bit & 7)));
+          }
+        }
+      }
+    }
+    fromFile = false;
+  }
+
+  void clear() {
+    data.clear(); data.shrink_to_fit();
+    w = h = 0; frames = 0; frameBytes = 0;
+  }
+  bool loaded() const { return frames > 0; }
+};
+
+class BadAppleMod {
+public:
+  static BadAppleMod &instance() {
+    static BadAppleMod mod;
+    return mod;
+  }
+
+  BadAppleMod() : mSelf(*ll::mod::NativeMod::current()) {}
+  [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
 
   bool load() {
-    self.getLogger().info("BadAppleOverlay test mod loaded");
+    getSelf().getLogger().info("BadApple loaded");
     return true;
   }
+
   bool enable() {
-    if (!imagesRegistered) {
-      panel = makeRgba(kPanelW, kPanelH, 18, 18, 22, 235);
-      title = makeRgba(kPanelW, kTitleH, 60, 60, 68, 255);
-      if (!pl::modmenu::registerImage("bad_apple_overlay.panel", panel, kPanelW, kPanelH)) return false;
-      if (!pl::modmenu::registerImage("bad_apple_overlay.title", title, kPanelW, kTitleH)) return false;
-      imagesRegistered = true;
+    const bool ok =
+        pl::modmenu::ModuleBuilder(kModuleId, "Bad Apple")
+            .modId(getSelf().getId())
+            .description("Plays Bad Apple as a HUD overlay. Turn this module on to start.")
+            .defaultEnabled(false)
+            .onToggle(onModuleToggle)
+            .config(kBlockSizeKey, "Resolution (1-16)", pl::modmenu::ConfigType::SliderInt, "4", "1", "16")
+            .config(kFpsKey, "Playback FPS (0 = file default, 10-30)", pl::modmenu::ConfigType::SliderInt, "0", "0", "30")
+            .config(kLoopKey, "Loop", pl::modmenu::ConfigType::Toggle, "true")
+            .config(kSoundKey, "Play Sound (not implemented yet)", pl::modmenu::ConfigType::Toggle, "true")
+            .config(kPosXKey, "Position X", pl::modmenu::ConfigType::SliderInt, "40", "0", "2000")
+            .config(kPosYKey, "Position Y", pl::modmenu::ConfigType::SliderInt, "80", "0", "1000")
+            .onConfigChanged(onConfigChanged)
+            .registerModule();
+    if (!ok) {
+      getSelf().getLogger().error("Failed to register module {}", kModuleId);
+      return false;
     }
-    if (!pl::modmenu::ModuleBuilder(kModuleId, "Bad Apple Overlay (test)")
-          .modId(self.getId())
-          .description("Test draggable in-game panel. Video/audio playback is not implemented in this test build.")
-          .defaultEnabled(false)
-          .registerModule()) return false;
-    // The callback cannot be removed with an API we know of, so register it once
-    // and let the 'active' flag decide whether it does anything.
-    if (!touchRegistered) {
-      pl::input::registerTouchCallback([](const pl::input::TouchEvent& e) {
-        return instance().onTouch(e);
-      });
-      touchRegistered = true;
-    }
-    active = true;
-    draw();
+    getSelf().getLogger().info("Registered module {}", kModuleId);
+    startWorker();
     return true;
   }
+
   bool disable() {
-    active = false;
-    dragging = false;
-    pl::modmenu::submitDrawCommands(kModuleId, {});
+    stopWorker();
+    clearOverlay();
+    pl::modmenu::unregisterModule(kModuleId);
+    getSelf().getLogger().info("Disabled");
+    return true;
+  }
+
+  bool unload() {
+    stopWorker();
     pl::modmenu::unregisterModule(kModuleId);
     return true;
   }
-private:
-  bool onTouch(const pl::input::TouchEvent& e) {
-    if (!active) return false;
-    // Android touch action values: DOWN=0, UP=1, MOVE=2, CANCEL=3.
-    if (e.action == 0) {
-      dragging = (e.x >= x && e.x <= x + kPanelW && e.y >= y && e.y <= y + kTitleH);
-      if (dragging) { lastX = e.x; lastY = e.y; return true; }
-    } else if (e.action == 2 && dragging) {
-      x += static_cast<int>(e.x - lastX);
-      y += static_cast<int>(e.y - lastY);
-      lastX = e.x; lastY = e.y;
-      x = std::max(0, x); y = std::max(0, y);
-      draw();
-      return true;
-    } else if (e.action == 1 || e.action == 3) {
-      const bool wasDragging = dragging;
-      dragging = false;
-      return wasDragging;
-    }
-    return false;
-  }
-  void draw() {
-    const std::vector<pl::modmenu::DrawCommand> commands = {
-      {.type = pl::modmenu::DrawCommandType::Image, .x = static_cast<float>(x), .y = static_cast<float>(y), .w = static_cast<float>(kPanelW), .h = static_cast<float>(kPanelH), .imageId = "bad_apple_overlay.panel"},
-      {.type = pl::modmenu::DrawCommandType::Image, .x = static_cast<float>(x), .y = static_cast<float>(y), .w = static_cast<float>(kPanelW), .h = static_cast<float>(kTitleH), .imageId = "bad_apple_overlay.title"}
-    };
-    pl::modmenu::submitDrawCommands(kModuleId, commands);
-  }
-  ll::mod::NativeMod& self;
-  std::vector<unsigned char> panel, title;
-  int x = 40, y = 80;
-  float lastX = 0, lastY = 0;
-  bool dragging = false;
-  bool active = false;
-  bool imagesRegistered = false;
-  bool touchRegistered = false;
-};
-}
 
-PL_REGISTER_MOD(BadAppleOverlayMod, BadAppleOverlayMod::instance())
+private:
+  ll::mod::NativeMod &mSelf;
+  std::atomic_bool mActive{false};
+  std::atomic_bool mRunning{false};
+  std::atomic_int mBlock{4}, mFps{0}, mPosX{40}, mPosY{80};
+  std::atomic_bool mLoop{true}, mSound{true};
+  std::atomic_bool mRestart{false};
+  std::mutex mVideoMutex;
+  Video mVideo;
+  std::thread mWorker;
+
+  static void onModuleToggle(std::string_view id, bool enabled) {
+    instance().handleToggle(id, enabled);
+  }
+  static void onConfigChanged(std::string_view id, std::string_view key, std::string_view value) {
+    instance().handleConfig(id, key, value);
+  }
+
+  void clearOverlay() {
+    pl::modmenu::submitDrawCommands(kModuleId, std::span<const pl::modmenu::DrawCommand>{});
+  }
+
+  void handleToggle(std::string_view id, bool enabled) {
+    if (id != kModuleId) return;
+    if (enabled) {
+      {
+        std::lock_guard lock(mVideoMutex);
+        if (!mVideo.loaded()) {
+          const std::string dir = moduleDir();
+          bool ok = false;
+          for (const char *rel : {"/resources/bad_apple.bap", "/bad_apple.bap"}) {
+            if (mVideo.loadFile(dir + rel)) {
+              getSelf().getLogger().info("Loaded {}{} ({}x{}, {} frames)", dir, rel,
+                                         mVideo.w, mVideo.h, mVideo.frames);
+              ok = true;
+              break;
+            }
+          }
+          if (!ok) {
+            mVideo.makeTest();
+            getSelf().getLogger().warn("bad_apple.bap not found in {}, using test animation", dir);
+          }
+        }
+      }
+      mRestart = true;
+      mActive = true;
+    } else {
+      mActive = false;
+      clearOverlay();
+      std::lock_guard lock(mVideoMutex);
+      mVideo.clear();  // free RAM while off
+    }
+    getSelf().getLogger().info("Module {} {}", id, enabled ? "enabled" : "disabled");
+  }
+
+  void handleConfig(std::string_view id, std::string_view key, std::string_view value) {
+    if (id != kModuleId) return;
+    if (key == kBlockSizeKey) mBlock = std::clamp(parseInt(value, mBlock.load()), 1, 16);
+    else if (key == kFpsKey) mFps = std::clamp(parseInt(value, mFps.load()), 0, 30);
+    else if (key == kLoopKey) mLoop = parseBool(value, mLoop.load());
+    else if (key == kSoundKey) mSound = parseBool(value, mSound.load());
+    else if (key == kPosXKey) mPosX = std::clamp(parseInt(value, mPosX.load()), 0, 2000);
+    else if (key == kPosYKey) mPosY = std::clamp(parseInt(value, mPosY.load()), 0, 1000);
+  }
+
+  void startWorker() {
+    if (mRunning.exchange(true)) return;
+    mWorker = std::thread([this] { workerLoop(); });
+  }
+
+  void stopWorker() {
+    if (!mRunning.exchange(false)) return;
+    if (mWorker.joinable()) mWorker.join();
+  }
+
+  void workerLoop() {
+    using clock = std::chrono::steady_clock;
+    auto start = clock::now();
+    while (mRunning) {
+      int fps = 15;
+      if (mActive) {
+        if (mRestart.exchange(false)) start = clock::now();
+        std::vector<pl::modmenu::DrawCommand> cmds;
+        bool finished = false;
+        {
+          std::lock_guard lock(mVideoMutex);
+          if (mVideo.loaded()) {
+            fps = mFps > 0 ? mFps.load() : mVideo.fps;
+            fps = std::max(fps, 1);
+            const double ms = std::chrono::duration<double, std::milli>(clock::now() - start).count();
+            size_t idx = static_cast<size_t>(ms * fps / 1000.0);
+            if (idx >= mVideo.frames) {
+              if (mLoop) idx %= mVideo.frames;
+              else { idx = mVideo.frames - 1; finished = true; }
+            }
+            buildCommands(idx, cmds);
+          }
+        }
+        if (!cmds.empty()) pl::modmenu::submitDrawCommands(kModuleId, cmds);
+        if (finished) mActive = false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000 / std::max(fps, 1)));
+    }
+  }
+
+  void buildCommands(size_t frameIdx, std::vector<pl::modmenu::DrawCommand> &out) const {
+    const int b = std::clamp(mBlock.load(), 1, 16);
+    const float ox = static_cast<float>(mPosX.load());
+    const float oy = static_cast<float>(mPosY.load());
+    const uint8_t *fr = &mVideo.data[frameIdx * mVideo.frameBytes];
+    out.reserve(static_cast<size_t>(mVideo.h) * 4 + 1);
+    out.push_back({.type = pl::modmenu::DrawCommandType::RectFilled, .x = ox, .y = oy,
+                   .w = static_cast<float>(mVideo.w * b), .h = static_cast<float>(mVideo.h * b),
+                   .color = 0xFF000000u});
+    for (int y = 0; y < mVideo.h; ++y) {
+      int runStart = -1;
+      for (int x = 0; x <= mVideo.w; ++x) {
+        bool white = false;
+        if (x < mVideo.w) {
+          const size_t bit = static_cast<size_t>(y) * mVideo.w + x;
+          white = (fr[bit >> 3] >> (7 - (bit & 7))) & 1;
+        }
+        if (white && runStart < 0) runStart = x;
+        if (!white && runStart >= 0) {
+          out.push_back({.type = pl::modmenu::DrawCommandType::RectFilled,
+                         .x = ox + static_cast<float>(runStart * b), .y = oy + static_cast<float>(y * b),
+                         .w = static_cast<float>((x - runStart) * b), .h = static_cast<float>(b),
+                         .color = 0xFFFFFFFFu});
+          runStart = -1;
+        }
+      }
+    }
+  }
+};
+
+} // namespace
+
+PL_REGISTER_MOD(BadAppleMod, BadAppleMod::instance())
