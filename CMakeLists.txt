@@ -10,5 +10,5 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(preloader_android)
 add_library(bad_apple_overlay SHARED src/BadAppleOverlay.cpp)
-target_link_libraries(bad_apple_overlay PRIVATE preloader)
+target_link_libraries(bad_apple_overlay PRIVATE preloader log)
 target_compile_options(bad_apple_overlay PRIVATE -Wall -Wextra)
