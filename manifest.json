@@ -1,8 +1,10 @@
 {
   "type": "preload-native",
   "name": "BadAppleOverlay",
-  "author": "DarkMint + ChatGPT",
+  "author": "DarkMint",
   "version": "0.1.0-test",
   "entry": "libbad_apple_overlay.so",
+  "icon": "icon.png",
+  "overwrite_files": ["icon.png"],
   "minecraft_versions": ["1.26.*"]
 }
