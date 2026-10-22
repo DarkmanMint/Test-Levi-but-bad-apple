@@ -36,27 +36,40 @@ public:
     return true;
   }
   bool enable() {
-    panel = makeRgba(kPanelW, kPanelH, 18, 18, 22, 235);
-    title = makeRgba(kPanelW, kTitleH, 60, 60, 68, 255);
-    if (!pl::modmenu::registerImage("bad_apple_overlay.panel", panel, kPanelW, kPanelH)) return false;
-    if (!pl::modmenu::registerImage("bad_apple_overlay.title", title, kPanelW, kTitleH)) return false;
+    if (!imagesRegistered) {
+      panel = makeRgba(kPanelW, kPanelH, 18, 18, 22, 235);
+      title = makeRgba(kPanelW, kTitleH, 60, 60, 68, 255);
+      if (!pl::modmenu::registerImage("bad_apple_overlay.panel", panel, kPanelW, kPanelH)) return false;
+      if (!pl::modmenu::registerImage("bad_apple_overlay.title", title, kPanelW, kTitleH)) return false;
+      imagesRegistered = true;
+    }
     if (!pl::modmenu::ModuleBuilder(kModuleId, "Bad Apple Overlay (test)")
           .modId(self.getId())
           .description("Test draggable in-game panel. Video/audio playback is not implemented in this test build.")
-          .defaultEnabled(true)
+          .defaultEnabled(false)
           .registerModule()) return false;
-    pl::input::registerTouchCallback([](const pl::input::TouchEvent& e) {
-      return instance().onTouch(e);
-    });
+    // The callback cannot be removed with an API we know of, so register it once
+    // and let the 'active' flag decide whether it does anything.
+    if (!touchRegistered) {
+      pl::input::registerTouchCallback([](const pl::input::TouchEvent& e) {
+        return instance().onTouch(e);
+      });
+      touchRegistered = true;
+    }
+    active = true;
     draw();
     return true;
   }
   bool disable() {
+    active = false;
+    dragging = false;
+    pl::modmenu::submitDrawCommands(kModuleId, {});
     pl::modmenu::unregisterModule(kModuleId);
     return true;
   }
 private:
   bool onTouch(const pl::input::TouchEvent& e) {
+    if (!active) return false;
     // Android touch action values: DOWN=0, UP=1, MOVE=2, CANCEL=3.
     if (e.action == 0) {
       dragging = (e.x >= x && e.x <= x + kPanelW && e.y >= y && e.y <= y + kTitleH);
@@ -87,6 +100,9 @@ private:
   int x = 40, y = 80;
   float lastX = 0, lastY = 0;
   bool dragging = false;
+  bool active = false;
+  bool imagesRegistered = false;
+  bool touchRegistered = false;
 };
 }
 
