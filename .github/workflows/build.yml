@@ -35,7 +35,7 @@ jobs:
           VIDEO=$(find . -type f -name '*.mp4' -not -path './build/*' -not -path './dist/*' | head -n1)
           if [ -n "$VIDEO" ]; then
             echo "Converting $VIDEO"
-            python3 tools/make_bap.py "$VIDEO" dist/BadAppleOverlay/resources/bad_apple.bap 160 120 15
+            python3 tools/make_bap.py "$VIDEO" dist/BadAppleOverlay/resources/bad_apple.bap 240 180 15
             ffmpeg -y -v error -i "$VIDEO" -vn -ac 2 -b:a 96k dist/BadAppleOverlay/resources/bad_apple.mp3 || echo "No audio track found"
           else
             echo "No .mp4 found, the mod will play the test animation"
