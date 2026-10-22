@@ -6,7 +6,7 @@ include(FetchContent)
 FetchContent_Declare(
   preloader_android
   GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
-  GIT_TAG 0.2.2
+  GIT_TAG 0.2.3
 )
 FetchContent_MakeAvailable(preloader_android)
 add_library(bad_apple_overlay SHARED src/BadAppleOverlay.cpp)
