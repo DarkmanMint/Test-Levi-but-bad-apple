@@ -28,14 +28,15 @@ jobs:
       - name: Package .levipack
         run: |
           mkdir -p dist/BadAppleOverlay/config dist/BadAppleOverlay/resources
-          cp manifest.json dist/BadAppleOverlay/        
+          cp manifest.json dist/BadAppleOverlay/
           cp icon.png dist/BadAppleOverlay/
           cp config/config.json config/config.schema.json dist/BadAppleOverlay/config/
           cp build/libbad_apple_overlay.so dist/BadAppleOverlay/
           VIDEO=$(find . -type f -name '*.mp4' -not -path './build/*' -not -path './dist/*' | head -n1)
           if [ -n "$VIDEO" ]; then
             echo "Converting $VIDEO"
-            python3 tools/make_bap.py "$VIDEO" dist/BadAppleOverlay/resources/bad_apple.bap
+            python3 tools/make_bap.py "$VIDEO" dist/BadAppleOverlay/resources/bad_apple.bap 128 96 15
+            ffmpeg -y -v error -i "$VIDEO" -vn -ac 2 -b:a 96k dist/BadAppleOverlay/resources/bad_apple.mp3 || echo "No audio track found"
           else
             echo "No .mp4 found, the mod will play the test animation"
           fi
