@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BadAppleOverlay config",
+  "type": "object",
+  "properties": {
+    "version": {"type":"integer","minimum":1},
+    "enabled": {"type":"boolean","default":true},
+    "panel_x": {"type":"integer","minimum":0,"default":40},
+    "panel_y": {"type":"integer","minimum":0,"default":80},
+    "panel_width": {"type":"integer","minimum":240,"maximum":900,"default":360},
+    "panel_height": {"type":"integer","minimum":120,"maximum":600,"default":220}
+  },
+  "additionalProperties": false
+}
