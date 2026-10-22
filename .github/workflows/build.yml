@@ -28,7 +28,8 @@ jobs:
       - name: Package .levipack
         run: |
           mkdir -p dist/BadAppleOverlay/config dist/BadAppleOverlay/resources
-          cp manifest.json dist/BadAppleOverlay/
+          cp manifest.json dist/BadAppleOverlay/        
+          cp icon.png dist/BadAppleOverlay/
           cp config/config.json config/config.schema.json dist/BadAppleOverlay/config/
           cp build/libbad_apple_overlay.so dist/BadAppleOverlay/
           VIDEO=$(find . -type f -name '*.mp4' -not -path './build/*' -not -path './dist/*' | head -n1)
