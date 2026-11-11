@@ -6,7 +6,7 @@ include(FetchContent)
 FetchContent_Declare(
   levilaunchroid
   GIT_REPOSITORY https://github.com/LiteLDev/LeviLaunchroid.git
-  GIT_TAG main
+  GIT_TAG v1.6.1
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR app/src/main/cpp/preloader
 )
