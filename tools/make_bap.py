@@ -2,7 +2,7 @@
 """Convert a video into a .bap file (grayscale, 2/4/16 levels) for the Bad Apple module.
 
 Usage: python3 make_bap.py input.mp4 output.bap [width height fps levels]
-Defaults: 96x72 at 15 fps, 4 gray levels.
+Defaults: 480x360 at 30 fps, 4 gray levels.
 
 levels: 2 = pure black/white, 4 = black, dark gray, light gray, white, 16 = fine gray.
 
