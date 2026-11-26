@@ -1,13 +1,12 @@
-// Bad Apple player module (v3).
+// Bad Apple player module (v5: grayscale).
 // - Registers a Mod Menu module (master switch = the module's own on/off).
 // - Draws 1-bit frames as filled rectangles via pl::modmenu::submitDrawCommands.
 // - If resources/bad_apple.bap is not found next to the .so, it plays a built-in
 //   test animation (bouncing white box) so you can check that drawing works.
 // - Audio: plays resources/bad_apple.mp3 through android.media.MediaPlayer (JNI).
 //
-// .bap format (little-endian):
-//   "BAP1", u16 width, u16 height, u16 fps, u16 reserved, u32 frameCount,
-//   then frameCount * ceil(width*height/8) bytes, row-major, MSB first, 1 = white.
+// .bap format: see tools/make_bap.py (BAP2 = grayscale with 2, 4 or 16 levels;
+// old BAP1 = black/white is still readable).
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
 
@@ -222,26 +221,46 @@ private:
 
 struct Video {
   int w = 0, h = 0, fps = 15;
+  int levels = 2;  // number of gray levels (2, 4 or 16)
+  int bpp = 1;     // bits per pixel (1, 2 or 4)
   uint32_t frames = 0;
   size_t frameBytes = 0;
   std::vector<uint8_t> data;
   bool fromFile = false;
 
+  static int bppFor(int lv) { return lv <= 2 ? 1 : (lv <= 4 ? 2 : 4); }
+
+  // Level (0 = black ... levels-1 = white) of pixel index i = y * w + x in a frame.
+  uint8_t pixel(const uint8_t *fr, size_t i) const {
+    const size_t bit = i * static_cast<size_t>(bpp);
+    return static_cast<uint8_t>((fr[bit >> 3] >> (8 - bpp - static_cast<int>(bit & 7))) & ((1 << bpp) - 1));
+  }
+  void setPixel(uint8_t *fr, size_t i, uint8_t v) const {
+    const size_t bit = i * static_cast<size_t>(bpp);
+    fr[bit >> 3] |= static_cast<uint8_t>(v << (8 - bpp - static_cast<int>(bit & 7)));
+  }
+
+  // Reads "BAP1" (2 levels) or "BAP2" (levels stored in the header).
   bool loadFile(const std::string &path) {
     FILE *f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     char magic[4];
-    uint16_t pw = 0, ph = 0, pfps = 0, rsv = 0;
+    uint16_t pw = 0, ph = 0, pfps = 0, plv = 0;
     uint32_t n = 0;
-    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "BAP1", 4) == 0 &&
+    bool ok = std::fread(magic, 1, 4, f) == 4 &&
+              (std::memcmp(magic, "BAP1", 4) == 0 || std::memcmp(magic, "BAP2", 4) == 0) &&
               std::fread(&pw, 2, 1, f) == 1 && std::fread(&ph, 2, 1, f) == 1 &&
-              std::fread(&pfps, 2, 1, f) == 1 && std::fread(&rsv, 2, 1, f) == 1 &&
+              std::fread(&pfps, 2, 1, f) == 1 && std::fread(&plv, 2, 1, f) == 1 &&
               std::fread(&n, 4, 1, f) == 1 && pw > 0 && ph > 0 && pfps > 0 && n > 0;
     if (ok) {
-      w = pw; h = ph; fps = pfps; frames = n;
-      frameBytes = (static_cast<size_t>(w) * h + 7) / 8;
-      data.resize(frameBytes * frames);
-      ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+      const int lv = std::memcmp(magic, "BAP1", 4) == 0 ? 2 : plv;
+      ok = lv == 2 || lv == 4 || lv == 16;
+      if (ok) {
+        w = pw; h = ph; fps = pfps; frames = n; levels = lv; bpp = bppFor(lv);
+        frameBytes = (static_cast<size_t>(w) * h * bpp + 7) / 8;
+        data.resize(frameBytes * frames);
+        ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+      }
     }
     std::fclose(f);
     if (!ok) clear();
@@ -249,22 +268,24 @@ struct Video {
     return ok;
   }
 
-  // Built-in test animation: a bouncing white box with a white border.
+  // Built-in test animation (4 gray levels): bouncing box with a gray shadow.
   void makeTest() {
-    w = 64; h = 48; fps = 15; frames = 120;
-    frameBytes = (static_cast<size_t>(w) * h + 7) / 8;
+    w = 64; h = 48; fps = 15; frames = 120; levels = 4; bpp = 2;
+    frameBytes = (static_cast<size_t>(w) * h * bpp + 7) / 8;
     data.assign(frameBytes * frames, 0);
     for (uint32_t t = 0; t < frames; ++t) {
+      uint8_t *fr = &data[t * frameBytes];
       const int bx = static_cast<int>(t * 2) % (2 * (w - 12));
       const int boxX = bx < (w - 12) ? bx : 2 * (w - 12) - bx;
       for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-          const bool border = x == 0 || y == 0 || x == w - 1 || y == h - 1;
-          const bool box = x >= boxX && x < boxX + 12 && y >= 18 && y < 30;
-          if (border || box) {
-            const size_t bit = static_cast<size_t>(y) * w + x;
-            data[t * frameBytes + (bit >> 3)] |= static_cast<uint8_t>(1u << (7 - (bit & 7)));
-          }
+          uint8_t v = 0;
+          if (x == 0 || y == 0 || x == w - 1 || y == h - 1) v = 3;                  // white border
+          else if (y >= 36 && y < 40) v = 1;                                         // dark gray band
+          else if (y >= 40 && y < 44) v = 2;                                         // light gray band
+          if (x >= boxX && x < boxX + 12 && y >= 18 && y < 30) v = 3;                // white box
+          else if (x >= boxX + 2 && x < boxX + 14 && y >= 20 && y < 32) v = 1;       // gray shadow
+          if (v) setPixel(fr, static_cast<size_t>(y) * w + x, v);
         }
       }
     }
@@ -277,6 +298,43 @@ struct Video {
   }
   bool loaded() const { return frames > 0; }
 };
+
+// Calls emit(x0, y0, x1, y1, level) for every rectangle (in pixels, x1/y1 exclusive)
+// needed to draw one frame. Level 0 (black) is skipped: it is the background.
+// Equal runs in consecutive rows are merged into one taller rectangle.
+template <class Emit>
+void forEachRect(const Video &v, size_t frameIdx, Emit &&emit) {
+  struct Run { int x0, x1, lv, y0; };
+  const uint8_t *fr = &v.data[frameIdx * v.frameBytes];
+  std::vector<Run> prev, cur;
+  std::vector<char> matched;
+  for (int y = 0; y <= v.h; ++y) {
+    cur.clear();
+    if (y < v.h) {
+      int x = 0;
+      while (x < v.w) {
+        const uint8_t lv = v.pixel(fr, static_cast<size_t>(y) * v.w + x);
+        int x1 = x + 1;
+        while (x1 < v.w && v.pixel(fr, static_cast<size_t>(y) * v.w + x1) == lv) ++x1;
+        if (lv) cur.push_back({x, x1, lv, y});
+        x = x1;
+      }
+    }
+    matched.assign(prev.size(), 0);
+    size_t i = 0;
+    for (Run &c : cur) {
+      while (i < prev.size() && prev[i].x0 < c.x0) ++i;
+      if (i < prev.size() && prev[i].x0 == c.x0 && prev[i].x1 == c.x1 && prev[i].lv == c.lv) {
+        c.y0 = prev[i].y0;
+        matched[i] = 1;
+      }
+    }
+    for (size_t k = 0; k < prev.size(); ++k) {
+      if (!matched[k]) emit(prev[k].x0, prev[k].y0, prev[k].x1, y, prev[k].lv);
+    }
+    prev = cur;
+  }
+}
 
 class BadAppleMod {
 public:
@@ -475,29 +533,17 @@ private:
     const int b = std::clamp(mBlock.load(), 1, 16);
     const float ox = static_cast<float>(mPosX.load());
     const float oy = static_cast<float>(mPosY.load());
-    const uint8_t *fr = &mVideo.data[frameIdx * mVideo.frameBytes];
-    out.reserve(static_cast<size_t>(mVideo.h) * 4 + 1);
     out.push_back({.type = pl::modmenu::DrawCommandType::RectFilled, .x = ox, .y = oy,
                    .w = static_cast<float>(mVideo.w * b), .h = static_cast<float>(mVideo.h * b),
                    .color = 0xFF000000u});
-    for (int y = 0; y < mVideo.h; ++y) {
-      int runStart = -1;
-      for (int x = 0; x <= mVideo.w; ++x) {
-        bool white = false;
-        if (x < mVideo.w) {
-          const size_t bit = static_cast<size_t>(y) * mVideo.w + x;
-          white = (fr[bit >> 3] >> (7 - (bit & 7))) & 1;
-        }
-        if (white && runStart < 0) runStart = x;
-        if (!white && runStart >= 0) {
-          out.push_back({.type = pl::modmenu::DrawCommandType::RectFilled,
-                         .x = ox + static_cast<float>(runStart * b), .y = oy + static_cast<float>(y * b),
-                         .w = static_cast<float>((x - runStart) * b), .h = static_cast<float>(b),
-                         .color = 0xFFFFFFFFu});
-          runStart = -1;
-        }
-      }
-    }
+    const int top = mVideo.levels - 1;
+    forEachRect(mVideo, frameIdx, [&](int x0, int y0, int x1, int y1, int lv) {
+      const uint32_t g = static_cast<uint32_t>(lv * 255 / top);
+      out.push_back({.type = pl::modmenu::DrawCommandType::RectFilled,
+                     .x = ox + static_cast<float>(x0 * b), .y = oy + static_cast<float>(y0 * b),
+                     .w = static_cast<float>((x1 - x0) * b), .h = static_cast<float>((y1 - y0) * b),
+                     .color = 0xFF000000u | (g << 16) | (g << 8) | g});
+    });
   }
 };
 
