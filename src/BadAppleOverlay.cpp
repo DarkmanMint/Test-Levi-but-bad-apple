@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -219,6 +221,59 @@ private:
   }
 };
 
+// ------------------------------------------------------------ saved settings
+// Plain "key=value" lines in <mod config dir>/badapple_settings.txt.
+struct SavedSettings {
+  int blockSize = 4, fps = 0, posX = 40, posY = 80;
+  bool loop = true, sound = true;
+};
+
+std::filesystem::path settingsPath() {
+  const auto mod = pl::mod::NativeMod::current();
+  if (!mod) return {};
+  return std::filesystem::path(mod->getConfigDir()) / "badapple_settings.txt";
+}
+
+SavedSettings readSettings(const std::filesystem::path &path) {
+  SavedSettings s;
+  if (path.empty()) return s;
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) {
+    const auto eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = line.substr(0, eq);
+    const std::string value = line.substr(eq + 1);
+    if (key == kBlockSizeKey) s.blockSize = std::clamp(parseInt(value, s.blockSize), 1, 16);
+    else if (key == kFpsKey) s.fps = std::clamp(parseInt(value, s.fps), 0, 30);
+    else if (key == kLoopKey) s.loop = parseBool(value, s.loop);
+    else if (key == kSoundKey) s.sound = parseBool(value, s.sound);
+    else if (key == kPosXKey) s.posX = std::clamp(parseInt(value, s.posX), 0, 2000);
+    else if (key == kPosYKey) s.posY = std::clamp(parseInt(value, s.posY), 0, 1000);
+  }
+  return s;
+}
+
+bool writeSettings(const std::filesystem::path &path, const SavedSettings &s) {
+  if (path.empty()) return false;
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  const std::filesystem::path tmp = path.string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return false;
+    out << kBlockSizeKey << '=' << s.blockSize << '\n'
+        << kFpsKey << '=' << s.fps << '\n'
+        << kLoopKey << '=' << (s.loop ? "true" : "false") << '\n'
+        << kSoundKey << '=' << (s.sound ? "true" : "false") << '\n'
+        << kPosXKey << '=' << s.posX << '\n'
+        << kPosYKey << '=' << s.posY << '\n';
+    if (!out) return false;
+  }
+  std::filesystem::rename(tmp, path, ec);  // replace the old file in one step
+  return !ec;
+}
+
 struct Video {
   int w = 0, h = 0, fps = 15;
   int levels = 2;  // number of gray levels (2, 4 or 16)
@@ -352,18 +407,19 @@ public:
   }
 
   bool enable() {
+    loadSaved();
     const bool ok =
         pl::modmenu::ModuleBuilder(kModuleId, "Bad Apple")
             .modId(getSelf().getId())
             .description("Plays Bad Apple as a HUD overlay. Turn this module on to start.")
             .defaultEnabled(false)
             .onToggle(onModuleToggle)
-            .config(kBlockSizeKey, "Resolution (1-16)", pl::modmenu::ConfigType::SliderInt, "4", "1", "16")
-            .config(kFpsKey, "Playback FPS (0 = file default, 10-30)", pl::modmenu::ConfigType::SliderInt, "0", "0", "30")
-            .config(kLoopKey, "Loop", pl::modmenu::ConfigType::Toggle, "true")
-            .config(kSoundKey, "Play Sound (not implemented yet)", pl::modmenu::ConfigType::Toggle, "true")
-            .config(kPosXKey, "Position X", pl::modmenu::ConfigType::SliderInt, "40", "0", "2000")
-            .config(kPosYKey, "Position Y", pl::modmenu::ConfigType::SliderInt, "80", "0", "1000")
+            .config(kBlockSizeKey, "Resolution (1-16)", pl::modmenu::ConfigType::SliderInt, std::to_string(mBlock.load()), "1", "16")
+            .config(kFpsKey, "Playback FPS (0 = file default, 10-30)", pl::modmenu::ConfigType::SliderInt, std::to_string(mFps.load()), "0", "30")
+            .config(kLoopKey, "Loop", pl::modmenu::ConfigType::Toggle, mLoop ? "true" : "false")
+            .config(kSoundKey, "Play Sound", pl::modmenu::ConfigType::Toggle, mSound ? "true" : "false")
+            .config(kPosXKey, "Position X", pl::modmenu::ConfigType::SliderInt, std::to_string(mPosX.load()), "0", "2000")
+            .config(kPosYKey, "Position Y", pl::modmenu::ConfigType::SliderInt, std::to_string(mPosY.load()), "0", "1000")
             .onConfigChanged(onConfigChanged)
             .registerModule();
     if (!ok) {
@@ -377,6 +433,7 @@ public:
 
   bool disable() {
     stopWorker();
+    flushSettings();
     mAudio.stop();
     clearOverlay();
     pl::modmenu::unregisterModule(kModuleId);
@@ -386,6 +443,7 @@ public:
 
   bool unload() {
     stopWorker();
+    flushSettings();
     mAudio.stop();
     pl::modmenu::unregisterModule(kModuleId);
     return true;
@@ -398,6 +456,7 @@ private:
   std::atomic_int mBlock{4}, mFps{0}, mPosX{40}, mPosY{80};
   std::atomic_bool mLoop{true}, mSound{true};
   std::atomic_bool mRestart{false};
+  std::atomic<long long> mDirtyAtMs{0};  // 0 = nothing to save
   std::mutex mVideoMutex;
   Video mVideo;
   Audio mAudio;
@@ -409,6 +468,32 @@ private:
   }
   static void onConfigChanged(std::string_view id, std::string_view key, std::string_view value) {
     instance().handleConfig(id, key, value);
+  }
+
+  static long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count() + 1;
+  }
+
+  void loadSaved() {
+    const SavedSettings s = readSettings(settingsPath());
+    mBlock = s.blockSize; mFps = s.fps; mLoop = s.loop;
+    mSound = s.sound; mPosX = s.posX; mPosY = s.posY;
+  }
+
+  void flushSettings() {
+    if (mDirtyAtMs.exchange(0) == 0) return;
+    SavedSettings s;
+    s.blockSize = mBlock; s.fps = mFps; s.loop = mLoop;
+    s.sound = mSound; s.posX = mPosX; s.posY = mPosY;
+    if (!writeSettings(settingsPath(), s))
+      getSelf().getLogger().warn("Could not save settings");
+  }
+
+  // Saves ~0.4 s after the last change, so dragging a slider does not write on every tick.
+  void saveIfIdle() {
+    const long long t = mDirtyAtMs.load();
+    if (t != 0 && nowMs() - t >= 400) flushSettings();
   }
 
   void clearOverlay() {
@@ -474,6 +559,8 @@ private:
     }
     else if (key == kPosXKey) mPosX = std::clamp(parseInt(value, mPosX.load()), 0, 2000);
     else if (key == kPosYKey) mPosY = std::clamp(parseInt(value, mPosY.load()), 0, 1000);
+    else return;
+    mDirtyAtMs = nowMs();
   }
 
   void startWorker() {
@@ -525,6 +612,7 @@ private:
           mAudio.stop();
         }
       }
+      saveIfIdle();
       std::this_thread::sleep_for(std::chrono::milliseconds(1000 / std::max(fps, 1)));
     }
   }
