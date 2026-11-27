@@ -38,11 +38,24 @@ constexpr const char *kLoopKey = "loop";
 constexpr const char *kSoundKey = "sound";
 constexpr const char *kPosXKey = "posX";
 constexpr const char *kPosYKey = "posY";
+constexpr const char *kQualityKey = "quality";  // 0 = bad_apple.bap, 1 = bad_apple_240.bap
 
 bool parseBool(std::string_view v, bool fallback) {
   if (v == "true" || v == "1" || v == "on") return true;
   if (v == "false" || v == "0" || v == "off") return false;
   return fallback;
+}
+
+// The menu may report a radio choice by its index ("0", "1") or by its label.
+int parseQuality(std::string_view v, int fallback) {
+  const std::string t(v);
+  if (t.find("240") != std::string::npos || t.find("Medium") != std::string::npos) return 1;
+  if (t.find("480") != std::string::npos || t.find("High") != std::string::npos) return 0;
+  const char *p = t.c_str();
+  char *end = nullptr;
+  const long n = std::strtol(p, &end, 10);
+  if (end == p || *end != '\0') return fallback;
+  return n == 1 ? 1 : 0;
 }
 
 int parseInt(std::string_view v, int fallback) {
@@ -224,7 +237,7 @@ private:
 // ------------------------------------------------------------ saved settings
 // Plain "key=value" lines in <mod config dir>/badapple_settings.txt.
 struct SavedSettings {
-  int blockSize = 4, fps = 0, posX = 40, posY = 80;
+  int blockSize = 4, fps = 0, posX = 40, posY = 80, quality = 0;
   bool loop = true, sound = true;
 };
 
@@ -250,6 +263,7 @@ SavedSettings readSettings(const std::filesystem::path &path) {
     else if (key == kSoundKey) s.sound = parseBool(value, s.sound);
     else if (key == kPosXKey) s.posX = std::clamp(parseInt(value, s.posX), 0, 2000);
     else if (key == kPosYKey) s.posY = std::clamp(parseInt(value, s.posY), 0, 1000);
+    else if (key == kQualityKey) s.quality = parseQuality(value, s.quality);
   }
   return s;
 }
@@ -267,7 +281,8 @@ bool writeSettings(const std::filesystem::path &path, const SavedSettings &s) {
         << kLoopKey << '=' << (s.loop ? "true" : "false") << '\n'
         << kSoundKey << '=' << (s.sound ? "true" : "false") << '\n'
         << kPosXKey << '=' << s.posX << '\n'
-        << kPosYKey << '=' << s.posY << '\n';
+        << kPosYKey << '=' << s.posY << '\n'
+        << kQualityKey << '=' << s.quality << '\n';
     if (!out) return false;
   }
   std::filesystem::rename(tmp, path, ec);  // replace the old file in one step
@@ -414,6 +429,8 @@ public:
             .description("Plays Bad Apple as a HUD overlay. Turn this module on to start.")
             .defaultEnabled(false)
             .onToggle(onModuleToggle)
+            .config(kQualityKey, "Video quality", pl::modmenu::ConfigType::Radio,
+                    std::to_string(mQuality.load()), "High 480x360,Medium 240x180")
             .config(kBlockSizeKey, "Resolution (1-16)", pl::modmenu::ConfigType::SliderInt, std::to_string(mBlock.load()), "1", "16")
             .config(kFpsKey, "Playback FPS (0 = file default, 10-30)", pl::modmenu::ConfigType::SliderInt, std::to_string(mFps.load()), "0", "30")
             .config(kLoopKey, "Loop", pl::modmenu::ConfigType::Toggle, mLoop ? "true" : "false")
@@ -453,9 +470,10 @@ private:
   ll::mod::NativeMod &mSelf;
   std::atomic_bool mActive{false};
   std::atomic_bool mRunning{false};
-  std::atomic_int mBlock{4}, mFps{0}, mPosX{40}, mPosY{80};
+  std::atomic_int mBlock{4}, mFps{0}, mPosX{40}, mPosY{80}, mQuality{0};
   std::atomic_bool mLoop{true}, mSound{true};
   std::atomic_bool mRestart{false};
+  std::atomic_bool mReloadVideo{false};  // worker thread (re)loads the picture file
   std::atomic<long long> mDirtyAtMs{0};  // 0 = nothing to save
   std::mutex mVideoMutex;
   Video mVideo;
@@ -478,14 +496,14 @@ private:
   void loadSaved() {
     const SavedSettings s = readSettings(settingsPath());
     mBlock = s.blockSize; mFps = s.fps; mLoop = s.loop;
-    mSound = s.sound; mPosX = s.posX; mPosY = s.posY;
+    mSound = s.sound; mPosX = s.posX; mPosY = s.posY; mQuality = s.quality;
   }
 
   void flushSettings() {
     if (mDirtyAtMs.exchange(0) == 0) return;
     SavedSettings s;
     s.blockSize = mBlock; s.fps = mFps; s.loop = mLoop;
-    s.sound = mSound; s.posX = mPosX; s.posY = mPosY;
+    s.sound = mSound; s.posX = mPosX; s.posY = mPosY; s.quality = mQuality;
     if (!writeSettings(settingsPath(), s))
       getSelf().getLogger().warn("Could not save settings");
   }
@@ -500,28 +518,32 @@ private:
     pl::modmenu::submitDrawCommands(kModuleId, std::span<const pl::modmenu::DrawCommand>{});
   }
 
+  // Loads the picture file that matches the chosen quality (caller holds mVideoMutex).
+  // Quality 1 prefers bad_apple_240.bap and falls back to bad_apple.bap if it is missing.
+  void loadVideoLocked() {
+    const std::string dir = moduleDir();
+    std::vector<std::string> names;
+    if (mQuality == 1) {
+      names.push_back("/resources/bad_apple_240.bap");
+      names.push_back("/bad_apple_240.bap");
+    }
+    names.push_back("/resources/bad_apple.bap");
+    names.push_back("/bad_apple.bap");
+    for (const std::string &rel : names) {
+      if (mVideo.loadFile(dir + rel)) {
+        getSelf().getLogger().info("Loaded {}{} ({}x{}, {} frames)", dir, rel,
+                                   mVideo.w, mVideo.h, mVideo.frames);
+        return;
+      }
+    }
+    mVideo.makeTest();
+    getSelf().getLogger().warn("bad_apple.bap not found in {}, using test animation", dir);
+  }
+
   void handleToggle(std::string_view id, bool enabled) {
     if (id != kModuleId) return;
     if (enabled) {
-      {
-        std::lock_guard lock(mVideoMutex);
-        if (!mVideo.loaded()) {
-          const std::string dir = moduleDir();
-          bool ok = false;
-          for (const char *rel : {"/resources/bad_apple.bap", "/bad_apple.bap"}) {
-            if (mVideo.loadFile(dir + rel)) {
-              getSelf().getLogger().info("Loaded {}{} ({}x{}, {} frames)", dir, rel,
-                                         mVideo.w, mVideo.h, mVideo.frames);
-              ok = true;
-              break;
-            }
-          }
-          if (!ok) {
-            mVideo.makeTest();
-            getSelf().getLogger().warn("bad_apple.bap not found in {}, using test animation", dir);
-          }
-        }
-      }
+      mReloadVideo = true;  // big file: loaded on the worker thread, not on the menu thread
       mAudioPath.clear();
       {
         const std::string dir = moduleDir();
@@ -559,6 +581,16 @@ private:
     }
     else if (key == kPosXKey) mPosX = std::clamp(parseInt(value, mPosX.load()), 0, 2000);
     else if (key == kPosYKey) mPosY = std::clamp(parseInt(value, mPosY.load()), 0, 1000);
+    else if (key == kQualityKey) {
+      const int q = parseQuality(value, mQuality.load());
+      if (q != mQuality.load()) {
+        mQuality = q;
+        if (mActive) {  // switch picture file and start over together with the sound
+          mReloadVideo = true;
+          mRestart = true;
+        }
+      }
+    }
     else return;
     mDirtyAtMs = nowMs();
   }
@@ -581,6 +613,11 @@ private:
     while (mRunning) {
       int fps = 15;
       if (mActive) {
+        if (mReloadVideo.exchange(false)) {
+          std::lock_guard lock(mVideoMutex);
+          mVideo.clear();
+          loadVideoLocked();
+        }
         if (mRestart.exchange(false)) {
           audioOn = mSound && !mAudioPath.empty() && mAudio.start(mAudioPath);
           start = clock::now();  // reset the picture clock right after the sound starts
